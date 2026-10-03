@@ -33,6 +33,14 @@ androidApplication(nameSpace = project.sampleAppId) {
             )
             signingConfig = signingConfigs.getByName("sample")
         }
+        // The target of :samples:androidBenchmark. It is a release build that the shell can
+        // profile, and it adds the benchmark screens in src/benchmark. The applicationId suffix
+        // keeps it from replacing a sample app already installed on the device.
+        create("benchmark") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".benchmark"
+            matchingFallbacks += listOf("release")
+        }
     }
 
     flavorDimensions.add("default")
@@ -79,6 +87,11 @@ dependencies {
     implementation(libs.panpf.assemblyadapter4.recycler.paging)
     implementation(libs.panpf.zoomimage.view)
     implementation(libs.penfeizhou.animation.awebp)
+
+    // Macrobenchmark reaches the app through profileinstaller. It writes a skip file there, so that
+    // no profile is installed in the background during a run. A cold-start benchmark also drops the
+    // shader cache through it, which fails without profileinstaller on a device that is not rooted.
+    "benchmarkImplementation"(libs.androidx.profileinstaller)
 
     debugImplementation(libs.leakcanary)
     debugImplementation(libs.jetbrains.compose.ui.tooling)  // For compose preview

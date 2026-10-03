@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <!-- Lets the shell, and so a macrobenchmark, trace and profile this release build. -->
+        <profileable
+            android:shell="true"
+            tools:targetApi="29" />
+
+        <!-- The images library declares this provider under a fixed authority, and no two installed
+             apps may share one. Without a new authority this build cannot be installed beside the
+             sample app. The benchmark screens load no content:// images. -->
+        <provider
+            android:name="com.github.panpf.sketch.images.ImagesFileProvider"
+            android:authorities="${applicationId}.images.fileprovider"
+            tools:replace="android:authorities" />
+
+        <activity
+            android:name="com.github.panpf.sketch.sample.benchmark.ImageGridBenchmarkActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
+</manifest>
