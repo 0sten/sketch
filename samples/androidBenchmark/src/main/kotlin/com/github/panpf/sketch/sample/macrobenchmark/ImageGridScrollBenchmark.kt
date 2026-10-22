@@ -25,6 +25,9 @@ import org.junit.runner.RunWith
  * - `onForgottenSumMs` and `onForgottenCount`: the same for state that leaves the composition.
  * - the CPU times of [AppCpuMetric].
  *
+ * The `WithoutMemoryCache` test starts the grid without the memory cache, so that many images are
+ * still loading when their cell leaves the screen and their load is cancelled.
+ *
  * Run with:
  * `./gradlew :samples:androidBenchmark:connectedBenchmarkAndroidTest`
  */
@@ -38,7 +41,14 @@ class ImageGridScrollBenchmark {
     @Test
     fun scrollImageGridCompilationModeFull() = scrollImageGrid(CompilationMode.Full())
 
-    private fun scrollImageGrid(compilationMode: CompilationMode) = benchmarkRule.measureRepeated(
+    @Test
+    fun scrollImageGridWithoutMemoryCacheCompilationModeFull() =
+        scrollImageGrid(CompilationMode.Full(), memoryCache = false)
+
+    private fun scrollImageGrid(
+        compilationMode: CompilationMode,
+        memoryCache: Boolean = true,
+    ) = benchmarkRule.measureRepeated(
         packageName = TARGET_PACKAGE,
         metrics = listOf(
             FrameTimingMetric(),
@@ -54,7 +64,10 @@ class ImageGridScrollBenchmark {
         setupBlock = {
             // A new process for every iteration, so each run starts with an empty memory cache.
             killProcess()
-            startActivityAndWait(Intent().setClassName(packageName, ACTIVITY))
+            startActivityAndWait(
+                Intent().setClassName(packageName, ACTIVITY)
+                    .putExtra(EXTRA_MEMORY_CACHE, memoryCache)
+            )
             // The first screen's images decode on background threads. Let them finish so the
             // measured scroll starts from a quiet app.
             Thread.sleep(SETTLE_MILLIS)
@@ -73,6 +86,7 @@ class ImageGridScrollBenchmark {
 
         // These match ImageGridBenchmarkActivity's ACTION_SCROLL and its extras.
         const val ACTION_SCROLL = "com.github.panpf.sketch.sample.benchmark.SCROLL"
+        const val EXTRA_MEMORY_CACHE = "memoryCache"
 
         const val ITERATIONS = 10
         const val SETTLE_MILLIS = 1500L

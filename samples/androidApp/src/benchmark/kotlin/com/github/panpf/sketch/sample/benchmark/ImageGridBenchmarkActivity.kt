@@ -22,7 +22,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.github.panpf.sketch.AsyncImage
+import com.github.panpf.sketch.LocalPlatformContext
+import com.github.panpf.sketch.cache.CachePolicy
 import com.github.panpf.sketch.images.ComposeResImageFiles
+import com.github.panpf.sketch.request.ImageRequest
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.delay
@@ -44,6 +47,10 @@ import kotlin.time.TimeSource
  * cycles through 27 small local images. After the first screen they all come from the memory
  * cache, which leaves the work of composing, remembering and forgetting each image's state as the
  * main cost of a new row.
+ *
+ * Started with [EXTRA_MEMORY_CACHE] false, the cells do not use the memory cache. Every image is
+ * then decoded again from the result cache on a background thread, so many cells leave the screen
+ * while their image is still loading.
  */
 class ImageGridBenchmarkActivity : ComponentActivity() {
 
@@ -69,8 +76,9 @@ class ImageGridBenchmarkActivity : ComponentActivity() {
             /* filter = */ IntentFilter(ACTION_SCROLL),
             /* flags = */ ContextCompat.RECEIVER_EXPORTED,
         )
+        val memoryCache = intent.getBooleanExtra(EXTRA_MEMORY_CACHE, true)
         setContent {
-            ImageGrid(scrollRuns)
+            ImageGrid(scrollRuns, memoryCache)
         }
     }
 
@@ -91,6 +99,9 @@ class ImageGridBenchmarkActivity : ComponentActivity() {
 
         /** The initial velocity of each fling, in pixels per second. */
         const val EXTRA_VELOCITY = "velocity"
+
+        /** An extra of the start intent: false to load the images without the memory cache. */
+        const val EXTRA_MEMORY_CACHE = "memoryCache"
     }
 }
 
@@ -110,7 +121,7 @@ private val IMAGE_URIS: List<String> = (
     ).map { it.uri }
 
 @Composable
-private fun ImageGrid(scrollRuns: ReceiveChannel<ScrollRun>) {
+private fun ImageGrid(scrollRuns: ReceiveChannel<ScrollRun>, memoryCache: Boolean) {
     val gridState = rememberLazyGridState()
     val flingBehavior = ScrollableDefaults.flingBehavior()
     LaunchedEffect(gridState, flingBehavior) {
@@ -133,12 +144,24 @@ private fun ImageGrid(scrollRuns: ReceiveChannel<ScrollRun>) {
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         items(count = ITEM_COUNT, contentType = { 0 }) { index ->
-            AsyncImage(
-                uri = IMAGE_URIS[index % IMAGE_URIS.size],
-                contentDescription = null,
-                modifier = Modifier.aspectRatio(1f),
-                contentScale = ContentScale.Crop,
-            )
+            val uri = IMAGE_URIS[index % IMAGE_URIS.size]
+            if (memoryCache) {
+                AsyncImage(
+                    uri = uri,
+                    contentDescription = null,
+                    modifier = Modifier.aspectRatio(1f),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                AsyncImage(
+                    request = ImageRequest(LocalPlatformContext.current, uri) {
+                        memoryCachePolicy(CachePolicy.DISABLED)
+                    },
+                    contentDescription = null,
+                    modifier = Modifier.aspectRatio(1f),
+                    contentScale = ContentScale.Crop,
+                )
+            }
         }
     }
 }
