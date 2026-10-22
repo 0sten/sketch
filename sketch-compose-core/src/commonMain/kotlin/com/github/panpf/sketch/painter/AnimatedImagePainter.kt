@@ -43,16 +43,19 @@ import com.github.panpf.sketch.util.asComposeImageBitmap
 import com.github.panpf.sketch.util.copyPixelsFrom
 import com.github.panpf.sketch.util.erase
 import com.github.panpf.sketch.util.ioCoroutineDispatcher
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+import kotlin.time.TimeSource
 import kotlin.time.measureTime
 
 /**
@@ -170,7 +173,9 @@ class AnimatedImagePainter constructor(
     override fun onForgotten() {
         if (!rememberedCounter.forget()) return
         stopAnimation()
-        coroutineScope?.cancel()
+        // The scope is not cancelled: once stopped, the animation returns by itself. Cancelling
+        // it would throw a CancellationException through its suspended frames instead, and on
+        // Kotlin/Native every throw unwinds the stack with libunwind.
         coroutineScope = null
     }
 
@@ -247,25 +252,23 @@ class AnimatedImagePainter constructor(
                 "filterQuality=$filterQuality)"
     }
 
+    /**
+     * Plays [animatedImage] in one coroutine: it shows a frame, decodes the next one on the IO
+     * dispatcher, and waits for the rest of the frame's duration. [stop] completes the run's
+     * stop signal, which the coroutine checks after decoding and waits on with the frame's
+     * duration as a timeout, so it returns without being cancelled.
+     */
     private class AnimatedPlayer(
         private val animatedImage: AnimatedImage,
         private val onFrame: (ImageBitmap) -> Unit,
         private val onRepeatEnd: () -> Unit,
     ) {
 
-        private var frameCaches: MutableMap<Int, Bitmap>? = null
-        private val nextFrameChannel = Channel<Frame>()
-        private val renderChannel = Channel<Frame>()
-        private val decodeChannel = Channel<Frame>()
-        private var nextFrameJob: Job? = null
-        private var renderJob: Job? = null
-        private var decodeJob: Job? = null
-        private var repeatIndex = 0
-
+        private var stopSignal: CompletableDeferred<Unit>? = null
         private var currentFrame: Frame? = null
 
-        val running: Boolean
-            get() = renderJob?.isActive == true || decodeJob?.isActive == true || nextFrameJob?.isActive == true
+        var running: Boolean = false
+            private set
 
         fun start(coroutineScope: CoroutineScope) {
             if (running) {
@@ -279,83 +282,11 @@ class AnimatedImagePainter constructor(
                 return
             }
 
-            repeatIndex = 0
-            renderJob = coroutineScope.launch(Dispatchers.Main) {
-                for (newFrame in renderChannel) {
-                    val lastFrame = currentFrame
-                    currentFrame = newFrame
-                    onFrame(newFrame.frameBitmap.composeBitmap)
-
-                    // Number of repeat plays. -1: Indicates infinite repetition. When it is greater than or equal to 0, the total number of plays is equal to '1 + repeatCount'
-                    if (animatedImage.repeatCount >= 0 && newFrame.index == animatedImage.frameCount - 1) {
-                        repeatIndex++
-                    }
-                    if ((animatedImage.repeatCount < 0 || repeatIndex <= animatedImage.repeatCount)) {
-                        /*
-                         * Why use [nextFrameChannel] instead of sending the next frame directly in [renderChannel]?
-                         * Because you have to wait for the onFrame callback to complete before decoding the next frame,
-                         * otherwise the old bitmap may be overwritten by decoding before it has been replaced.
-                         */
-                        val nextItem = nextFrame(current = newFrame, last = lastFrame)
-                        nextFrameChannel.send(nextItem)
-
-                        val fameDuration = frameDuration(newFrame.index)
-                        delay(fameDuration)
-                    } else {
-                        onRepeatEnd()
-                    }
-                }
-            }
-            decodeJob = coroutineScope.launch(ioCoroutineDispatcher()) {
-                for (frame in decodeChannel) {
-                    frame.frameBitmap.bitmap.erase(Color.Transparent.toArgb())
-
-                    val cacheBitmap = frameCaches?.get(frame.index)
-                    if (cacheBitmap != null) {
-                        frame.frameBitmap.bitmap.copyPixelsFrom(cacheBitmap)
-                    } else {
-                        val decodeElapsedTime = measureTime {
-                            try {
-                                animatedImage.readFrame(frame.frameBitmap.bitmap, frame.index)
-                            } catch (e: Throwable) {
-                                e.printStackTrace()
-                                stop()
-                            }
-                        }
-
-                        /*
-                         * The closer Codec is to the last frame when decoding animations,
-                         * the longer the decoding time will be.
-                         * This will cause the animation playback speed to become slower and slower,
-                         * so here the frames whose decoding time exceeds the duration of the previous frame are cached.
-                         */
-                        if (animatedImage.cacheDecodeTimeoutFrame) {
-                            val lastFrameIndex = if (frame.index > 0)
-                                frame.index - 1 else animatedImage.frameCount - 1
-                            val lastFrameDuration = frameDuration(lastFrameIndex)
-                            val needCache =
-                                decodeElapsedTime.inWholeMilliseconds > lastFrameDuration
-                            if (needCache) {
-                                val bitmap = animatedImage.createFrameBitmap()
-                                bitmap.copyPixelsFrom(frame.frameBitmap.bitmap)
-                                val frameCaches =
-                                    frameCaches ?: mutableMapOf<Int, Bitmap>().apply {
-                                        this@AnimatedPlayer.frameCaches = this
-                                    }
-                                frameCaches[frame.index] = bitmap
-                            }
-                        }
-                    }
-
-                    renderChannel.send(frame)
-                }
-            }
-            nextFrameJob = coroutineScope.launch(Dispatchers.Main) {
-                decodeChannel.send(nextFrame(current = currentFrame, last = null))
-
-                for (nextFrame in nextFrameChannel) {
-                    decodeChannel.send(nextFrame)
-                }
+            running = true
+            val stopSignal = CompletableDeferred<Unit>()
+            this.stopSignal = stopSignal
+            coroutineScope.launch(Dispatchers.Main) {
+                play(stopSignal)
             }
         }
 
@@ -363,10 +294,108 @@ class AnimatedImagePainter constructor(
             if (!running) {
                 return
             }
-            nextFrameJob?.cancel()
-            renderJob?.cancel()
-            decodeJob?.cancel()
-            frameCaches?.clear()
+            running = false
+            stopSignal?.complete(Unit)
+            stopSignal = null
+        }
+
+        @OptIn(ExperimentalCoroutinesApi::class)
+        private suspend fun play(stopSignal: CompletableDeferred<Unit>) {
+            if (stopSignal.isCompleted) return
+            // Frames whose decoding took longer than the previous frame's duration, see decode()
+            val frameCaches = mutableMapOf<Int, Bitmap>()
+            var repeatIndex = 0
+            var frame = nextFrame(current = currentFrame, last = null)
+            if (!decode(frame, frameCaches)) {
+                stopAfterDecodeError(stopSignal)
+                return
+            }
+            while (!stopSignal.isCompleted) {
+                val lastFrame = currentFrame
+                currentFrame = frame
+                onFrame(frame.frameBitmap.composeBitmap)
+
+                // Number of repeat plays. -1: Indicates infinite repetition. When it is greater than or equal to 0, the total number of plays is equal to '1 + repeatCount'
+                if (animatedImage.repeatCount >= 0 && frame.index == animatedImage.frameCount - 1) {
+                    repeatIndex++
+                }
+                if (animatedImage.repeatCount >= 0 && repeatIndex > animatedImage.repeatCount) {
+                    onRepeatEnd()
+                    return
+                }
+
+                // The next frame is decoded into the bitmap of the frame shown before this one,
+                // which is no longer drawn, while this one is shown.
+                val shownMark = TimeSource.Monotonic.markNow()
+                val nextFrame = nextFrame(current = frame, last = lastFrame)
+                if (!decode(nextFrame, frameCaches)) {
+                    stopAfterDecodeError(stopSignal)
+                    return
+                }
+                val remainingMillis =
+                    frameDuration(frame.index) - shownMark.elapsedNow().inWholeMilliseconds
+                if (stopSignal.isCompleted) return
+                if (remainingMillis > 0) {
+                    val stopped = select {
+                        stopSignal.onAwait { true }
+                        onTimeout(remainingMillis) { false }
+                    }
+                    if (stopped) return
+                }
+                frame = nextFrame
+            }
+        }
+
+        /**
+         * Returns false if the frame could not be decoded
+         */
+        private suspend fun decode(
+            frame: Frame,
+            frameCaches: MutableMap<Int, Bitmap>
+        ): Boolean = withContext(ioCoroutineDispatcher()) {
+            frame.frameBitmap.bitmap.erase(Color.Transparent.toArgb())
+
+            val cacheBitmap = frameCaches[frame.index]
+            if (cacheBitmap != null) {
+                frame.frameBitmap.bitmap.copyPixelsFrom(cacheBitmap)
+                return@withContext true
+            }
+
+            var decoded = true
+            val decodeElapsedTime = measureTime {
+                try {
+                    animatedImage.readFrame(frame.frameBitmap.bitmap, frame.index)
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    decoded = false
+                }
+            }
+
+            /*
+             * The closer Codec is to the last frame when decoding animations,
+             * the longer the decoding time will be.
+             * This will cause the animation playback speed to become slower and slower,
+             * so here the frames whose decoding time exceeds the duration of the previous frame are cached.
+             */
+            if (decoded && animatedImage.cacheDecodeTimeoutFrame) {
+                val lastFrameIndex = if (frame.index > 0)
+                    frame.index - 1 else animatedImage.frameCount - 1
+                val lastFrameDuration = frameDuration(lastFrameIndex)
+                val needCache = decodeElapsedTime.inWholeMilliseconds > lastFrameDuration
+                if (needCache) {
+                    val bitmap = animatedImage.createFrameBitmap()
+                    bitmap.copyPixelsFrom(frame.frameBitmap.bitmap)
+                    frameCaches[frame.index] = bitmap
+                }
+            }
+            decoded
+        }
+
+        private fun stopAfterDecodeError(stopSignal: CompletableDeferred<Unit>) {
+            // Only if this run is still the current one, it may have been stopped and restarted
+            if (this.stopSignal === stopSignal) {
+                stop()
+            }
         }
 
         private fun nextFrame(current: Frame?, last: Frame?): Frame {

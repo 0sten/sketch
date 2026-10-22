@@ -11,7 +11,12 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.toSize
 import com.github.panpf.sketch.painter.AnimatedImagePainter
 import com.github.panpf.sketch.test.TestAnimatedImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -101,6 +106,23 @@ class AnimatedImagePainterTest {
 
         animatedImagePainter.onForgotten()
         assertEquals(false, animatedImagePainter.isRunning())
+    }
+
+    @Test
+    fun testForgottenWithoutCancellingTheAnimation() = runTest {
+        // Cancelling the animation would throw a CancellationException through its suspended
+        // frames, and every throw is slow on Kotlin/Native. Stopped, it returns by itself.
+        withContext(Dispatchers.Main) {
+            val animatedImagePainter = AnimatedImagePainter(TestAnimatedImage(100, 100))
+            animatedImagePainter.onRemembered()
+            val animation = animatedImagePainter.coroutineScope!!.coroutineContext.job.children.single()
+            delay(120)  // A few frames of 50 milliseconds
+            assertTrue(animation.isActive)
+
+            animatedImagePainter.onForgotten()
+            animation.join()
+            assertFalse(animation.isCancelled)
+        }
     }
 
     @OptIn(ExperimentalTestApi::class)
